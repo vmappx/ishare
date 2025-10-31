@@ -1,0 +1,329 @@
+name: Build All Platforms
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms to build (comma-separated: android,ios,windows,linux or "all")'
+        required: true
+        default: 'all'
+        type: string
+
+env:
+  FLUTTER_VERSION: "3.32.8"
+  RUST_VERSION: "1.84.1"
+  APK_BUILD_DIR: "/tmp/build"
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      build_android: ${{ steps.check_platforms.outputs.build_android }}
+      build_ios: ${{ steps.check_platforms.outputs.build_ios }}
+      build_windows: ${{ steps.check_platforms.outputs.build_windows }}
+      build_linux: ${{ steps.check_platforms.outputs.build_linux }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from pubspec.yaml
+        id: get_version
+        run: |
+          VERSION=$(sed -n 's/^version: \([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' app/pubspec.yaml)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check which platforms to build
+        id: check_platforms
+        run: |
+          INPUT="${{ github.event.inputs.platforms }}"
+          if [[ "$INPUT" == "all" ]]; then
+            echo "build_android=true" >> $GITHUB_OUTPUT
+            echo "build_ios=true" >> $GITHUB_OUTPUT
+            echo "build_windows=true" >> $GITHUB_OUTPUT
+            echo "build_linux=true" >> $GITHUB_OUTPUT
+          else
+            if [[ "$INPUT" == *"android"* ]]; then
+              echo "build_android=true" >> $GITHUB_OUTPUT
+            else
+              echo "build_android=false" >> $GITHUB_OUTPUT
+            fi
+            if [[ "$INPUT" == *"ios"* ]]; then
+              echo "build_ios=true" >> $GITHUB_OUTPUT
+            else
+              echo "build_ios=false" >> $GITHUB_OUTPUT
+            fi
+            if [[ "$INPUT" == *"windows"* ]]; then
+              echo "build_windows=true" >> $GITHUB_OUTPUT
+            else
+              echo "build_windows=false" >> $GITHUB_OUTPUT
+            fi
+            if [[ "$INPUT" == *"linux"* ]]; then
+              echo "build_linux=true" >> $GITHUB_OUTPUT
+            else
+              echo "build_linux=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  build_android_apk:
+    needs: build
+    if: needs.build.outputs.build_android == 'true'
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Remove proprietary dependencies
+        run: sh scripts/remove_proprietary_dependencies.sh
+
+      - name: Copy files to env.APK_BUILD_DIR
+        run: |
+          mkdir -p $APK_BUILD_DIR
+          cp -r . $APK_BUILD_DIR
+
+      - name: Decode key.properties file
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        env:
+          ENCODED_STRING: ${{ secrets.ANDROID_KEY_PROPERTIES }}
+        run: |
+          if [ -n "$ENCODED_STRING" ]; then
+            echo $ENCODED_STRING | base64 -di > app/android/key.properties
+          else
+            echo "Warning: ANDROID_KEY_PROPERTIES secret not set, building unsigned APK"
+          fi
+
+      - name: Decode android-keystore.jks file
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        env:
+          ENCODED_STRING: ${{ secrets.ANDROID_KEY_STORE }}
+        run: |
+          if [ -n "$ENCODED_STRING" ]; then
+            mkdir -p secrets
+            echo $ENCODED_STRING | base64 -di > secrets/android-keystore.jks
+          else
+            echo "Warning: ANDROID_KEY_STORE secret not set, building unsigned APK"
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Check rust-toolchain.toml
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: rustup show
+
+      - name: Dependencies
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter build apk --split-per-abi
+
+      - name: Rename APK files
+        working-directory: ${{ env.APK_BUILD_DIR }}/app/build/app/outputs/flutter-apk
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          mv app-armeabi-v7a-release.apk iShare-${VERSION}-android-arm32v7.apk || true
+          mv app-arm64-v8a-release.apk iShare-${VERSION}-android-arm64v8.apk || true
+          mv app-x86_64-release.apk iShare-${VERSION}-android-x64.apk || true
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: |
+            ${{ env.APK_BUILD_DIR }}/app/build/app/outputs/flutter-apk/iShare-*.apk
+
+  build_ios:
+    needs: build
+    if: needs.build.outputs.build_ios == 'true'
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Dependencies
+        working-directory: app
+        run: flutter pub get
+
+      - name: Install CocoaPods dependencies
+        working-directory: app/ios
+        run: pod install
+
+      - name: Build iOS IPA
+        working-directory: app
+        run: flutter build ipa --release --no-codesign
+
+      - name: Rename IPA file
+        working-directory: app/build/ios/ipa
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          mv *.ipa iShare-${VERSION}-ios.ipa || true
+
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: app/build/ios/ipa/iShare-*.ipa
+
+  build_windows:
+    needs: build
+    if: needs.build.outputs.build_windows == 'true'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Dependencies
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build Windows
+        working-directory: app
+        run: flutter build windows --release
+
+      - name: Create settings.json
+        working-directory: app
+        run: echo {} > build/windows/x64/runner/Release/settings.json
+
+      - name: Add DLL files
+        working-directory: app
+        run: |
+          Copy-Item ../scripts/windows/x64/msvcp140.dll build/windows/x64/runner/Release/ -ErrorAction SilentlyContinue
+          Copy-Item ../scripts/windows/x64/vcruntime140.dll build/windows/x64/runner/Release/ -ErrorAction SilentlyContinue
+          Copy-Item ../scripts/windows/x64/vcruntime140_1.dll build/windows/x64/runner/Release/ -ErrorAction SilentlyContinue
+
+      - name: Create ZIP archive
+        working-directory: app
+        run: |
+          $VERSION = "${{ needs.build.outputs.version }}"
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "iShare-${VERSION}-windows-x64.zip"
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: app/iShare-*.zip
+
+  build_linux:
+    needs: build
+    if: needs.build.outputs.build_linux == 'true'
+    runs-on: ubuntu-20.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake libgtk-3-dev ninja-build libayatana-appindicator3-dev
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install flutter_distributor
+        run: dart pub global activate flutter_distributor
+
+      - name: Dependencies
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build Linux tarball
+        working-directory: app
+        run: flutter build linux --release
+
+      - name: Create tarball
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          cd app/build/linux/x64/release/bundle
+          tar -czf ../../../../../iShare-${VERSION}-linux-x64.tar.gz *
+
+      - name: Build DEB package
+        working-directory: app
+        run: |
+          export PATH="$PATH:$HOME/.pub-cache/bin"
+          flutter_distributor package --platform linux --targets deb
+
+      - name: Rename DEB file
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          DEB_FILE=$(find app/dist -name "*.deb" | head -n 1)
+          if [ -f "$DEB_FILE" ]; then
+            mv "$DEB_FILE" "iShare-${VERSION}-linux-x64.deb"
+          fi
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            iShare-*.tar.gz
+            iShare-*.deb
+
+  summary:
+    needs: [build, build_android_apk, build_ios, build_windows, build_linux]
+    if: always()
+    runs-on: ubuntu-20.04
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Version: ${{ needs.build.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          find artifacts -type f -name "iShare-*" -exec echo "- {}" \; >> $GITHUB_STEP_SUMMARY
